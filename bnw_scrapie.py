@@ -2,183 +2,211 @@
 bnw_bar_scraper_incremental.py
 ==============================
 • Grad years 2025-2028
-• 1-second pause between “Load More” clicks
-• Per-profile throttle: 5-25 s
-• Immediate append to bnw_bar_raw.csv after every OK player
+• Writes one row per player-year (blank BAR cols if no data)
+• Columns in this exact order:
+    grad_year, name, city_state, high_school, positions, bat_throw,
+    height, weight, summer_team,
+    test_year, 60_time, 60_pct, 60_class_pct, 60_state_pct,
+               30_time, 30_pct, 30_class_pct, 30_state_pct,
+               broad_ft, broad_pct, broad_class_pct, broad_state_pct,
+               l_time,   l_pct,   l_class_pct,   l_state_pct,
+               med_ft,   med_pct, med_class_pct, med_state_pct,
+    profile_url, timestamp
+• Jitter delay 2-10 s, cool-down 120 s every 40 OK rows
+• Immediate append to bnw_bar_raw.csv (flushed)
+• Skips duplicates across runs by (name, test_year)
 • Recomputes bnw_bar_percentiles.csv at the end
 """
-
-import asyncio, random, re, time, numpy as np, pandas as pd
+import asyncio, random, re, time, os, numpy as np, pandas as pd
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 from bs4 import BeautifulSoup
 
-BASE       = "https://baseballnorthwest.com"
-YEARS      = ["2028"]
-WAIT_MIN   = 5
-WAIT_MAX   = 25
-LOAD_WAIT  = 1
-CF_WAIT    = 60
-CF_RETRY   = 2
-RAW_FILE   = Path("bnw_bar_raw.csv")
+# ─── CONFIG ───────────────────────────────────────────────────────────────
+BASE, YEARS = "https://baseballnorthwest.com", ["2027"]
+WAIT_MIN, WAIT_MAX        = 2, 10         # per-profile jitter
+BURST_SIZE, BURST_PAUSE   = 40, 120       # cool-down after 40 rows
+LOAD_WAIT, CF_WAIT, CF_RETRY = 1, 60, 2
+RAW_FILE = Path("bnw_bar_raw.csv")
 
 DRILLS = {
     "60 YD":      ("60_time", "60_pct", "60_class_pct", "60_state_pct"),
     "30 YD":      ("30_time", "30_pct", "30_class_pct", "30_state_pct"),
     "Broad Jump": ("broad_ft", "broad_pct", "broad_class_pct", "broad_state_pct"),
-    "L-Drill":    ("l_time", "l_pct", "l_class_pct", "l_state_pct"),
-    "Med Ball":   ("med_ft", "med_pct", "med_class_pct", "med_state_pct"),
+    "L-Drill":    ("l_time",  "l_pct",   "l_class_pct",  "l_state_pct"),
+    "Med Ball":   ("med_ft",  "med_pct", "med_class_pct","med_state_pct"),
 }
 
-# ── utility helpers ───────────────────────────────────────────────────────
-log            = lambda m: print(time.strftime("%H:%M:%S"), m, flush=True)
-grad_url       = lambda y: f"{BASE}/find-player?graduation_year={y}&submit=Submit"
-tidy           = lambda s: s.strip().replace("\xa0", "")
-slug_to_name   = lambda s: s.replace("-", " ").title()
-looks_like_cf  = lambda h: ("Attention Required!" in h) or ('cf-error-details' in h)
+# ─── COLUMN ORDER ─────────────────────────────────────────────────────────
+BIO_COLS = [
+    "city_state", "high_school", "positions", "bat_throw",
+    "height", "weight", "summer_team",
+]
+DRILL_COLS = sum((list(vals) for vals in DRILLS.values()), [])  # flatten
+ALL_COLS = (
+    ["grad_year", "name"] +
+    BIO_COLS +
+    ["test_year"] +
+    DRILL_COLS +
+    ["profile_url", "timestamp"]
+)
 
-def to_percent(val: str):
-    if not val: return np.nan
-    val = val.strip()
-    if val.startswith("<"):
-        try:  return float(val[1:]) - 0.01
-        except ValueError: return np.nan
-    try:  return float(val)
-    except ValueError: return np.nan
+# ─── small helpers ────────────────────────────────────────────────────────
+tidy = lambda s: s.strip().replace("\xa0", "")
+slug_to_name = lambda s: s.replace("-", " ").title()
+grad_url = lambda y: f"{BASE}/find-player?graduation_year={y}&submit=Submit"
+looks_like_cf = lambda h: ("Attention Required!" in h) or ('cf-error-details' in h)
+log = lambda m: print(time.strftime("%H:%M:%S"), m, flush=True)
+
+def to_percent(txt:str): return txt.strip().replace("%","").replace("< ","<")
 
 def parse_stat(div):
     label = div.find("h4").get_text(strip=True)
     if label not in DRILLS: return {}
     score = tidy(div.select_one("div.stat-value").text)
-    ranks = {rp["data-type"]: tidy(rp.text).replace("%","").replace("< ","<")
+    ranks = {rp["data-type"]: to_percent(tidy(rp.text))
              for rp in div.select("div.rank-percentile")}
     sc, po, pc, ps = DRILLS[label]
-    return {
-        sc: score,
-        po: to_percent(ranks.get("overall", "")),
-        pc: to_percent(ranks.get("graduation_year", "")),
-        ps: to_percent(ranks.get("state", "")),
-    }
+    return {sc:score, po:ranks.get("overall",""),
+            pc:ranks.get("graduation_year",""), ps:ranks.get("state","")}
 
-# ── profile scraping ─────────────────────────────────────────────────────
-async def fetch_html(page, url):
-    url = url.split("#")[0] + "#player-bar-year"
-    for _ in range(CF_RETRY + 1):
-        await page.goto(url, timeout=45_000)
-        html = await page.content()
+def parse_bio(info):
+    get = lambda sel: tidy(info.select_one(sel).text) if info.select_one(sel) else ""
+    bio = {
+        "positions":   get(".player-position"),
+        "bat_throw":   get(".bat-throw"),
+        "height":      get(".height"),
+        "weight":      get(".weight"),
+        "summer_team": get(".summer-team"),
+    }
+    hs = info.select_one(".high-school")
+    if hs:
+        parts=[tidy(t) for t in hs.stripped_strings]
+        bio["high_school"]=parts[0].split(",")[0] if parts else ""
+        bio["city_state"]=parts[1] if len(parts)>1 else ""
+    else:
+        bio["high_school"]=bio["city_state"]=""
+    return bio
+
+# ─── scrape profile ───────────────────────────────────────────────────────
+async def fetch_html(page,url):
+    url_bar=url.split("#")[0]+"#player-bar-year"
+    for _ in range(CF_RETRY+1):
+        await page.goto(url_bar,timeout=45_000)
+        html=await page.content()
         if not looks_like_cf(html): return html
         log(f"   Cloudflare – wait {CF_WAIT}s"); await asyncio.sleep(CF_WAIT)
     return html
 
-async def scrape(page, url):
-    soup = BeautifulSoup(await fetch_html(page, url), "html.parser")
-    if not soup.select_one("div.player-stats"): return None
+async def scrape(page,url):
+    soup=BeautifulSoup(await fetch_html(page,url),"html.parser")
+    if not soup.select_one("div.player-stats"): return []
 
-    # ensure BAR items attached
-    if not soup.select_one("#player-bar-year div.stat-item"):
-        try:
-            await page.wait_for_selector("#player-bar-year div.stat-item",
-                                         state="attached", timeout=3000)
-            soup = BeautifulSoup(await page.content(), "html.parser")
-        except PwTimeout:
-            return None
+    slug=urlparse(url).path.split("/")[-1]
+    name=slug_to_name(slug)
+    sel=soup.select_one("#player-bar-year select.purei-bar-filter-select")
+    grad=sel.get("data_graduation_year","0000") if sel else "0000"
+    bio=parse_bio(soup.select_one("div.player-info-wrapper") or BeautifulSoup("", "html.parser"))
 
-    # name & grad
-    slug  = urlparse(url).path.split("/")[-1]
-    name  = slug_to_name(slug)
-    sel   = soup.select_one("#player-bar-year select.purei-bar-filter-select")
-    grad  = sel.get("data-graduation_year", "0000") if sel else "0000"
+    rows=[]
+    for grp in soup.select("div[id^='player-bar-'] div.stat-group"):
+        m=re.search(r"purei-bar-data-(\d{4})"," ".join(grp.get("class",[])))
+        if not m: continue
+        yr=m.group(1)
+        data={"grad_year":grad,"name":name,"test_year":yr}|bio
+        for it in grp.select("div.stat-item"): data.update(parse_stat(it))
+        for col in DRILL_COLS: data.setdefault(col,"")
+        data.update(profile_url=url,timestamp=datetime.utcnow().isoformat(timespec="seconds"))
+        rows.append(data)
 
-    data = {}
-    for block in soup.select("#player-bar-year div.stat-item"):
-        data.update(parse_stat(block))
+    if not rows:
+        blank={"grad_year":grad,"name":name,"test_year":""}|bio
+        for col in DRILL_COLS: blank[col]=""
+        blank.update(profile_url=url,timestamp=datetime.utcnow().isoformat(timespec="seconds"))
+        rows.append(blank)
+    return rows
 
-    # ── FIXED missing-column check ────────────────────────────────────
-    missing = [vals[0] for vals in DRILLS.values() if vals[0] not in data]
-    if missing: return None
-
-    data.update(
-        name=name,
-        grad_year=grad,
-        profile_url=url,
-        timestamp=datetime.utcnow().isoformat(timespec="seconds"),
-    )
-    return data
-
-# ── collect profile links for a grad year ────────────────────────────────
-async def collect_year(page, year):
+# ─── collect links per year (same as before) ──────────────────────────────
+async def collect_year(page,year):
     log(f"-- Collecting {year} list --")
-    await page.goto(grad_url(year), timeout=45_000)
-    urls, prev = set(), 0
+    await page.goto(grad_url(year),timeout=45_000)
+    urls,prev=set(),0
     while True:
         for a in await page.locator("a[href^='/profiles/']").element_handles():
-            href = await a.get_attribute("href")
-            if href: urls.add(BASE + href)
-        btn = page.locator("button:has-text('Load More')")
+            href=await a.get_attribute("href")
+            if href: urls.add(BASE+href)
+        btn=page.locator("button:has-text('Load More')")
         if not await btn.count(): break
-        if not (await btn.first.is_visible() and await btn.first.is_enabled()):
-            break
+        if not (await btn.first.is_visible() and await btn.first.is_enabled()): break
         try: await btn.first.click(timeout=5000)
-        except (PwTimeout, asyncio.CancelledError):
-            log("   Load More click failed – stop list."); break
+        except (PwTimeout, asyncio.CancelledError): break
         await asyncio.sleep(LOAD_WAIT)
-        if len(urls) == prev: break
-        prev = len(urls)
+        if len(urls)==prev: break
+        prev=len(urls)
     log(f"Collected {len(urls):,} links for {year}")
     return urls
 
-# ── main orchestration ───────────────────────────────────────────────────
+# ─── main ─────────────────────────────────────────────────────────────────
 async def main():
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        page    = await browser.new_page()
+    seen=set()
+    if RAW_FILE.exists():
+        try:
+            tmp=pd.read_csv(RAW_FILE,usecols=["name","test_year"])
+            seen.update(zip(tmp["name"], tmp["test_year"].fillna("")))
+            log(f"Loaded {len(seen):,} existing name-year pairs.")
+        except Exception as e:
+            log(f"Couldn't read existing CSV ({e})")
 
-        links = set()
-        for y in YEARS:
-            links.update(await collect_year(page, y))
+    async with async_playwright() as pw:
+        browser=await pw.chromium.launch(headless=True)
+        page=await browser.new_page()
+
+        links=set()
+        for y in YEARS: links.update(await collect_year(page,y))
         log(f"Total unique links: {len(links):,}")
 
-        seen = set()
-        for idx, url in enumerate(links, 1):
+        ok=0
+        for idx,url in enumerate(links,1):
             log(f"[{idx}/{len(links)}] {url}")
-            row = await scrape(page, url)
+            for row in await scrape(page,url):
+                key=(row["name"], str(row["test_year"]))
+                if key in seen: continue
+                seen.add(key); ok+=1
+                for col in ALL_COLS: row.setdefault(col,"")
+                first=not RAW_FILE.exists()
+                with open(RAW_FILE,"a",newline="",encoding="utf-8",buffering=1) as f:
+                    pd.DataFrame([row], columns=ALL_COLS).to_csv(f,index=False,header=first)
+                    f.flush(); os.fsync(f.fileno())
+                    if first: log(f"CSV created at {RAW_FILE.resolve()}")
+                log(f"   wrote {row['name']} ({row['test_year'] or 'no BAR'})")
 
-            wait = random.uniform(WAIT_MIN, WAIT_MAX)
-            if row and row["name"] not in seen:
-                seen.add(row["name"])
-                # append immediately
-                first = not RAW_FILE.exists()
-                pd.DataFrame([row]).to_csv(
-                    RAW_FILE, mode="a", index=False, header=first
-                )
-                log(f"   wrote {row['name']}")
+            # pacing
+            if ok and ok% BURST_SIZE==0:
+                log(f"   Burst {BURST_SIZE} – cooling {BURST_PAUSE}s")
+                await asyncio.sleep(BURST_PAUSE)
             else:
-                log("   skip")
-            log(f"   wait {wait:0.1f}s"); await asyncio.sleep(wait)
+                await asyncio.sleep(random.uniform(WAIT_MIN,WAIT_MAX))
 
         await browser.close(); log("Browser closed.")
 
     if not RAW_FILE.exists():
-        log("No rows saved – exiting."); return
+        log("No rows saved."); return
 
     # recompute percentiles
-    df  = pd.read_csv(RAW_FILE)
-    idx = list(range(25, 100, 5)) + [99]
-    grid = {}
-
-    for drill, (col, *_p) in DRILLS.items():
-        ser = pd.to_numeric(                           # ← patched line
-            df[col].astype(str).str.replace("'", ".").str.replace('"', ""),
-            errors="coerce"
-        ).dropna()
-        grid[drill.replace(" ", "_")] = np.percentile(ser, idx).round(2)
-
-    pd.DataFrame(grid, index=idx).rename_axis("Percentile") \
-        .to_csv("bnw_bar_percentiles.csv")
+    df=pd.read_csv(RAW_FILE)
+    idx=list(range(25,100,5))+[99]; grid={}
+    for d,(col,*_) in DRILLS.items():
+        ser=pd.to_numeric(df[col].astype(str).str.replace("'",".").str.replace('"',''),
+                          errors="coerce").dropna()
+        if not ser.empty:
+            grid[d.replace(" ","_")]=np.percentile(ser,idx).round(2)
+    pd.DataFrame(grid,index=idx).rename_axis("Percentile")\
+      .to_csv("bnw_bar_percentiles.csv")
     log("bnw_bar_percentiles.csv saved")
-    log("=== done ===")
+    log("=== Finished ===")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
+
