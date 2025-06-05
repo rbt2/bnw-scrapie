@@ -23,9 +23,48 @@ from urllib.parse import urlparse
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 from bs4 import BeautifulSoup
+import sys
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────
-BASE, YEARS = "https://baseballnorthwest.com", ["2027"]
+BASE = "https://baseballnorthwest.com"
+
+# Prompt user for grad years
+HELP_TEXT = (
+    "Usage: python bnw_scrapie.py [YEAR1 YEAR2 ...] or run without arguments and enter years when prompted.\n"
+    "Example: python bnw_scrapie.py 2025 2026 2027\n"
+    "If no years are provided, you will be prompted to enter them as a comma-separated list (e.g. 2025,2026,2027,2028).\n"
+    "Allowed years: 2012 to current year (inclusive).\n"
+)
+MIN_YEAR = 2012
+MAX_YEAR = datetime.now().year
+
+def parse_years(raw_years):
+    valid_years = []
+    for y in raw_years:
+        try:
+            y_int = int(y)
+            if MIN_YEAR <= y_int <= MAX_YEAR:
+                valid_years.append(str(y_int))
+            else:
+                print(f"Year {y} is out of allowed range ({MIN_YEAR}-{MAX_YEAR}), skipping.")
+        except ValueError:
+            print(f"Invalid year: {y}, skipping.")
+    return valid_years
+
+if any(arg in sys.argv for arg in ('-h', '--help', '/?')):
+    print(HELP_TEXT)
+    sys.exit(0)
+
+if len(sys.argv) > 1:
+    YEARS = parse_years(sys.argv[1:])
+else:
+    years_input = input(f"Enter graduation years to pull (comma-separated, {MIN_YEAR}-{MAX_YEAR}): ")
+    YEARS = parse_years([y.strip() for y in years_input.split(",") if y.strip()])
+
+if not YEARS:
+    print(f"No valid years provided. Allowed range: {MIN_YEAR}-{MAX_YEAR}. Exiting.")
+    sys.exit(1)
+
 WAIT_MIN, WAIT_MAX        = 2, 10         # per-profile jitter
 BURST_SIZE, BURST_PAUSE   = 40, 120       # cool-down after 40 rows
 LOAD_WAIT, CF_WAIT, CF_RETRY = 1, 60, 2
