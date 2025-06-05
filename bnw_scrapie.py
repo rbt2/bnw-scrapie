@@ -204,6 +204,7 @@ async def main():
             grid[d.replace(" ","_")]=np.percentile(ser,idx).round(2)
     pd.DataFrame(grid,index=idx).rename_axis("Percentile")\
       .to_csv("bnw_bar_percentiles.csv")
+    log("Percentiles updated")
     log("bnw_bar_percentiles.csv saved")
     log("=== Finished ===")
 
